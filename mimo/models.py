@@ -1,0 +1,476 @@
+from __future__ import absolute_import
+from __future__ import division
+from six.moves import xrange
+import random
+import numpy as np
+import math
+from itertools import tee
+from collections import defaultdict
+
+import tensorflow as tf
+from tensorflow.python.ops import variable_scope as vs
+from tensorflow.python.ops import variable_scope
+from tensorflow.python.ops import rnn_cell
+from tensorflow.python.ops import rnn
+from tensorflow.python.ops.rnn import _rnn_step
+from tensorflow.python.ops import nn_ops
+from tensorflow.python.ops import math_ops
+from tensorflow.python.ops import init_ops
+from tensorflow.python.ops import embedding_ops
+from tensorflow.python.ops import control_flow_ops
+from tensorflow.python.ops import array_ops
+from tensorflow.python.framework import ops
+from tensorflow.python.framework import dtypes
+from tensorflow.python.framework import tensor_shape
+from tensorflow.python.ops.seq2seq import sequence_loss_by_example
+from tensorflow.python.ops import rnn, rnn_cell
+from tensorflow.python.ops import nn_ops
+from tensorflow.python.ops.nn import _compute_sampled_logits
+
+def sampled_sigmoid_loss(weights, biases, inputs, labels, num_sampled,
+                         num_classes, num_true=2,
+                         sampled_values=None,
+                         remove_accidental_hits=True,
+                         partition_strategy="mod",
+                         name="sampled_softmax_loss"):
+    logits, labels = _compute_sampled_logits(
+        weights, biases, inputs, labels, num_sampled, num_classes,
+        num_true=num_true,
+        sampled_values=sampled_values,
+        subtract_log_q=True,
+        remove_accidental_hits=remove_accidental_hits,
+        partition_strategy=partition_strategy,
+        name=name)
+    sampled_losses = nn_ops.sigmoid_cross_entropy_with_logits(logits, labels)
+    return sampled_losses
+
+def attention_decoder(decoder_inputs, sequence_length, initial_state, attention_matrix, cell,
+                      output_size=None, loop_function=None,
+                      dtype=dtypes.float32, scope=None,
+                      initial_state_attention=False):
+    if not decoder_inputs:
+        raise ValueError("Must provide at least 1 input to attention decoder.")
+    if not attention_matrix.get_shape()[1:].is_fully_defined():
+        raise ValueError("Shape of attention matrix must be known: %s" % attention_matrix.get_shape())
+    if output_size is None:
+        output_size = cell.output_size
+
+    with variable_scope.variable_scope(scope or "attention_decoder"):
+        #batch_size = array_ops.shape(decoder_inputs[0])[0]  # Needed for reshaping.
+        # Temporarily avoid EmbeddingWrapper and seq2seq badness
+        # TODO(lukaszkaiser): remove EmbeddingWrapper
+        if decoder_inputs[0].get_shape().ndims != 1:
+            (fixed_batch_size, input_size) = decoder_inputs[0].get_shape().with_rank(2)
+            if input_size.value is None:
+                raise ValueError(
+                    "Input size (second dimension of inputs[0]) must be accessible via "
+                    "shape inference, but saw value None.")
+        else:
+            fixed_batch_size = decoder_inputs[0].get_shape().with_rank_at_least(1)[0]
+
+        if fixed_batch_size.value:
+            batch_size = fixed_batch_size.value
+        else:
+            batch_size = array_ops.shape(decoder_inputs[0])[0]
+
+        if sequence_length is not None:
+            sequence_length = math_ops.to_int32(sequence_length)
+            zero_output = array_ops.zeros(array_ops.pack([batch_size, cell.output_size]), decoder_inputs[0].dtype)
+            zero_output.set_shape(tensor_shape.TensorShape([fixed_batch_size.value, cell.output_size]))
+            min_sequence_length = math_ops.reduce_min(sequence_length)
+            max_sequence_length = math_ops.reduce_max(sequence_length)
+
+        # ATTENTION COMPUTATION
+        
+        attn_size = attention_matrix.get_shape()[-1].value
+        batch_attn_size = array_ops.pack([batch_size, attn_size])
+
+        def _attention(query, states):
+            """Put attention masks on hidden using hidden_features and query."""
+            v = variable_scope.get_variable("AttnV", [attn_size])
+            k = variable_scope.get_variable("AttnW", [1, 1, attn_size, attn_size])
+
+            # attn is v^T * tanh(W1*h_t + U*q)
+            
+            # To calculate W1 * h_t we use a 1-by-1 convolution, need to reshape before.
+            attn_length = states.get_shape()[1].value
+            hidden = array_ops.reshape(states, [-1, attn_length, 1, attn_size])
+            hidden_features = nn_ops.conv2d(hidden, k, [1, 1, 1, 1], "SAME")
+
+            y = rnn_cell._linear(query, attn_size, True)
+            y = array_ops.reshape(y, [-1, 1, 1, attn_size])
+            # Attention mask is a softmax of v^T * tanh(...).
+            s = math_ops.reduce_sum(v * math_ops.tanh(hidden_features + y), [2, 3])
+            a = nn_ops.softmax(s)
+            # Now calculate the attention-weighted vector d.
+            d = math_ops.reduce_sum(array_ops.reshape(a, [-1, attn_length, 1, 1]) * hidden, [1, 2])
+            d = array_ops.reshape(d, [-1, attn_size])
+            return d
+
+        def attention(query):
+            outer_states = tf.unpack(attention_matrix, axis=1)
+
+            inner_states = []
+            for i, states in enumerate(outer_states):
+                with variable_scope.variable_scope("Attention_outer", reuse=i>0):
+                    inner_states.append(_attention(query, states))
+
+            with variable_scope.variable_scope("Attention_inner"):
+                return _attention(query, tf.pack(inner_states, 1))
+
+        state = cell.zero_state(batch_size, dtype) if initial_state == None else initial_state
+        outputs = []
+        prev = None
+
+        attns = array_ops.zeros(batch_attn_size, dtype=dtype)
+        attns.set_shape([None, attn_size])
+        
+        if initial_state_attention:
+            attns = attention(initial_state)
+        for i, inp in enumerate(decoder_inputs):
+            if i > 0:
+                variable_scope.get_variable_scope().reuse_variables()
+            # If loop_function is set, we use it instead of decoder_inputs.
+            if loop_function is not None and prev is not None:
+                with variable_scope.variable_scope("loop_function", reuse=True):
+                    inp = loop_function(prev, i)
+            # Merge input and previous attentions into one vector of the right size.
+            input_size = inp.get_shape().with_rank(2)[1]
+            if input_size.value is None:
+                raise ValueError("Could not infer input size from input: %s" % inp.name)
+            x = rnn_cell._linear([inp] + [attns], input_size, True)
+
+            if sequence_length is not None:
+                call_cell = lambda: cell(x, state)
+                if sequence_length is not None:
+                    cell_output, state = _rnn_step(
+                      i, sequence_length, min_sequence_length, max_sequence_length, zero_output, state, call_cell, cell.state_size)
+            else:
+                cell_output, state = cell(x, state)
+
+
+            # Run the attention mechanism.
+            if i == 0 and initial_state_attention:
+                with variable_scope.variable_scope(variable_scope.get_variable_scope(), reuse=True):
+                    attns = attention(state)
+            else:
+                attns = attention(state)
+
+            with variable_scope.variable_scope("AttnOutputProjection"):
+                output = rnn_cell._linear([cell_output] + [attns], output_size, True)
+            if loop_function is not None:
+                prev = output
+            outputs.append(output)
+
+    return outputs, state
+
+PAD_ID = 0
+GO_ID = 1
+EOS_ID = 2
+
+class Encoder(object):
+    def __init__(self, embedding, max_length, cell, num_symbols, dtype, **kwargs):
+        self.embedding = embedding
+        self.cell = cell
+
+        # account for _GO and _EOS
+        max_length += 2
+
+        self.lengths = kwargs.get('lengths', tf.placeholder(tf.int32, shape=[None], name="encoder_lengths"))
+        self.inputs = kwargs.get('inputs', [tf.placeholder(tf.int32, shape=[None], name="encoder_input{0}".format(i)) for i in xrange(max_length)])
+        self.weights = kwargs.get('weights', [tf.placeholder(tf.float32, shape=[None], name="encoder_weight{0}".format(i)) for i in xrange(max_length)])
+
+        inputs = [embedding_ops.embedding_lookup(embedding, i) for i in self.inputs]
+        self.outputs, self.state_fw, self.state_bw = rnn.bidirectional_rnn(self.cell, self.cell, inputs, sequence_length=self.lengths, dtype=dtype)
+
+        #self.outputs = [tf.add(*tf.split(1, 2, o)) for o in self.outputs]
+        self.state = self.state_fw + self.state_bw # aggregate fw+bw states
+        #self.state = tf.concat(1, [self.state_fw, self.state_bw]) # concatenate fw+bw states
+
+        top_states = [array_ops.reshape(e, [-1, 1, cell.output_size]) for e in self.outputs]
+        self.attention_states = array_ops.concat(1, top_states)
+
+    def transform_batch(self, feed, data):
+        data = [[GO_ID]+seq+[EOS_ID] for seq in data]
+        feed[self.lengths.name] = [len(seq) for seq in data]
+        for seq in data:
+            if len(seq) > len(self.inputs):
+                raise ValueError('Input sequence length (%i) larger than max encoder length (%i)' % (len(seq), len(self.inputs)))
+            for i in xrange(len(self.inputs)):
+                feed.setdefault(self.inputs[i].name, []).append(seq[i] if i < len(seq) else PAD_ID)
+                feed.setdefault(self.weights[i].name, []).append(1.0 if i < len(seq) else 0.0)
+
+class Decoder(object):
+    def __init__(self,
+                 embedding,
+                 max_length,
+                 initial_state,
+                 attention_states,
+                 cell,
+                 num_samples=512,
+                 feed_previous=False,
+                 update_embedding_for_previous=True,
+                 dtype=dtypes.float32,
+                 scope=None,
+                 initial_state_attention=False,
+                 **kwargs):
+        # account for _GO and _EOS
+        self.max_length = max_length + 2
+
+        self.lengths = kwargs.get('lengths', tf.placeholder(tf.int32, shape=[None], name="decoder_lengths"))
+        self.inputs = kwargs.get('inputs', [tf.placeholder(tf.int32, shape=[None], name="decoder_input{0}".format(i)) for i in xrange(self.max_length)])
+        self.weights = kwargs.get('weights', [tf.placeholder(tf.float32, shape=[None], name="decoder_weight{0}".format(i)) for i in xrange(self.max_length)])
+        
+        self.targets = [self.inputs[i + 1] for i in xrange(len(self.inputs) - 1)]
+        self.targets.append(tf.zeros_like(self.targets[0]))
+
+        num_symbols = embedding.get_shape()[0].value
+        output_projection = None
+        loss_function = None
+        self.cell = cell
+        self.feed_previous = feed_previous
+        
+        if num_samples > 0 and num_samples < num_symbols:
+            with tf.device('/cpu:0'):
+                w = tf.get_variable('proj_w', [cell.output_size, num_symbols])
+                w_t = tf.transpose(w)
+                b = tf.get_variable('proj_b', [num_symbols])
+            output_projection = (w, b)
+            def sampled_loss(inputs, labels):
+                with tf.device('/cpu:0'):
+                    labels = tf.reshape(labels, [-1, 1])
+                    return tf.nn.sampled_softmax_loss(w_t, b, inputs, labels, num_samples, num_symbols)
+            loss_function = sampled_loss
+        
+        output_size = None
+        if output_projection is None:
+            cell = rnn_cell.OutputProjectionWrapper(cell, num_symbols)
+            output_size = num_symbols
+        
+        if output_size is None:
+            output_size = cell.output_size
+        if output_projection is not None:
+            proj_weights = ops.convert_to_tensor(output_projection[0], dtype=dtype)
+            proj_weights.get_shape().assert_is_compatible_with([cell.output_size, num_symbols])
+            proj_biases = ops.convert_to_tensor(output_projection[1], dtype=dtype)
+            proj_biases.get_shape().assert_is_compatible_with([num_symbols])
+
+        with variable_scope.variable_scope(scope or "embedding_attention_decoder"):
+            loop_function = self._extract_argmax_and_embed(embedding, output_projection, update_embedding_for_previous) if feed_previous else None
+
+            emb_inp = [embedding_ops.embedding_lookup(embedding, i) for i in self.inputs]
+            self.outputs, self.state = attention_decoder(
+                emb_inp,
+                self.lengths,
+                initial_state,
+                attention_states,
+                cell,
+                output_size=output_size,
+                loop_function=loop_function,
+                initial_state_attention=initial_state_attention)
+
+        targets = [self.inputs[i + 1] for i in xrange(len(self.inputs) - 1)]
+        targets.append(tf.zeros_like(self.inputs[-1]))
+        
+        # loss for each instance in batch
+        self.instance_loss = sequence_loss_by_example(self.outputs, targets, self.weights, softmax_loss_function=loss_function)
+
+        # aggregated average loss per instance for batch
+        self.loss = tf.reduce_sum(self.instance_loss) / math_ops.cast(array_ops.shape(targets[0])[0], self.instance_loss.dtype)
+
+        if output_projection is not None:
+            self.projected_output = [tf.matmul(o, output_projection[0]) + output_projection[1] for o in self.outputs]
+            self.decoded_outputs = tf.unpack(tf.argmax(tf.pack(self.projected_output), 2))
+        else:
+            self.decoded_outputs = tf.unpack(tf.argmax(tf.pack(self.outputs), 2))
+        self.decoded_lenghts = tf.reduce_sum(tf.sign(tf.transpose(tf.pack(self.decoded_outputs))), 1)
+        self.decoded_batch = tf.transpose(tf.pack(self.decoded_outputs))
+
+    def decode_batch(self, session, feed, index_vocab):
+        results = []
+        for outputs in session.run(self.decoded_batch, feed):
+            result = []
+            found_eos = False
+            for t in outputs:
+                if t != EOS_ID:
+                    result.append(index_vocab[t])
+                else:
+                    found_eos = True
+                    break
+            results.append(result if found_eos else [])
+        return results
+    
+    def transform_batch(self, feed, data):
+        if self.feed_previous:
+            # TODO: assumes feed_previous == forward_only
+            feed[self.inputs[0].name] = [GO_ID]*len(data)
+            feed[self.lengths.name] = [self.max_length for _ in xrange(len(data))]
+        else:
+            data = [[GO_ID]+seq+[EOS_ID] for seq in data]
+            feed[self.lengths.name] = [len(seq) for seq in data]
+            for seq in data:
+                if len(seq) > len(self.inputs):
+                    raise ValueError('Input sequence length (%i) larger than max decoder length (%i)' % (len(seq), len(self.inputs)))
+                for i in xrange(len(self.inputs)):
+                    feed.setdefault(self.inputs[i].name, []).append(seq[i] if i < len(seq) else PAD_ID)
+                    feed.setdefault(self.weights[i].name, []).append(1.0 if i < len(seq) else 0.0)
+
+    @staticmethod
+    def _extract_argmax_and_embed(embedding, output_projection=None, update_embedding=True):
+        def loop_function(prev, _):
+            if output_projection is not None:
+                prev = nn_ops.xw_plus_b(prev, output_projection[0], output_projection[1])
+            prev_symbol = math_ops.argmax(prev, 1)
+            # Note that gradients will not propagate through the second parameter of embedding_lookup.
+            emb_prev = embedding_ops.embedding_lookup(embedding, prev_symbol)
+            if not update_embedding:
+                emb_prev = array_ops.stop_gradient(emb_prev)
+            return emb_prev
+        return loop_function
+
+class MultiEncoder(object):
+    def __init__(self,
+        vocab_size, size, num_layers, batch_size, embedding,
+        encoder_max_lens, share_encoder, encoder_args=None):
+
+        encoder_args = encoder_args or {}
+        self.vocab_size = vocab_size
+        self.batch_size = batch_size
+
+        self.encoder_names = [k for k, _ in encoder_max_lens.iteritems()]
+
+        cell = rnn_cell.GRUCell(size)
+        if num_layers > 1:
+            cell = rnn_cell.MultiRNNCell([cell] * num_layers)
+        with tf.variable_scope("many_seq_to_seq"):
+            self.encoders = {}
+            for i, (k, encoder_max_len) in enumerate(sorted(encoder_max_lens.iteritems())):
+                reuse = share_encoder and i != 0
+                vs_key = k.replace(' ', '_')
+                with tf.variable_scope("encoder"+('' if share_encoder else '_'+vs_key), reuse=reuse):
+                    print 'Building Encoder ['+k+']...' + (' (shared params)' if reuse else '')
+                    encoder = Encoder(embedding, encoder_max_len, cell, vocab_size, dtype=tf.float32, **encoder_args.get(k, {}))
+                with tf.variable_scope("encoder_"+vs_key):
+                    weight = encoder_args.get(k, {}).get('weight', tf.placeholder(tf.float32, shape=[None, 1], name="encoder_{0}_weight".format(k)))
+                    self.encoders[k] = {
+                        'encoder': encoder,
+                        'weight': weight,
+                    }
+            # TODO: may need to apply weights explicitly, i.e. (tf.reduce_sum(..)*weight)
+            # sum individual encoder outputs to get aggregate attention
+            states = [tf.reduce_sum(self.encoders[k]['encoder'].attention_states, 1, True) for k in self.encoder_names]
+            self.attention_states = array_ops.concat(1, states)
+            self.attention_matrix = tf.pack([self.encoders[k]['encoder'].attention_states for k in self.encoder_names], 1)
+
+            # sum individual encoder states to get aggregate state
+            self.state = tf.reduce_sum(tf.pack([self.encoders[k]['encoder'].state for k in self.encoder_names]), 0)
+
+    def transform_batch(self, feed, data):
+        for k, e in self.encoders.iteritems():
+            instances = [instance.get(k, []) for instance in data]
+            feed[e['weight'].name] = [[1.0 if i else 0.0] for i in instances]
+            e['encoder'].transform_batch(feed, instances)
+
+class MultiDecoder(object):
+    def __init__(self,
+        encoder,
+        vocab_size, size, num_layers, batch_size,
+        embedding, decoder_max_lens, share_decoder,
+        num_samples=512, forward_only=False, propagate_state=False, decoder_args=None):
+
+        decoder_args = decoder_args or {}
+        self.encoder = encoder
+        self.vocab_size = vocab_size
+        self.batch_size = batch_size
+        self.decoder_names = [k for k, _ in decoder_max_lens.iteritems()]
+        self.loss = None
+        self.forward_only = forward_only
+
+        cell = rnn_cell.GRUCell(size)
+        if num_layers > 1:
+            cell = rnn_cell.MultiRNNCell([cell] * num_layers)
+        with tf.variable_scope("embedding_attention_seq2seq"):
+            self.decoders = {}
+            for i, (k, decoder_max_len) in enumerate(sorted(decoder_max_lens.iteritems())):
+                reuse = share_decoder and i != 0
+                vs_key = k.replace(' ', '_')
+                with tf.variable_scope("decoder"+('' if share_decoder else '_'+vs_key), reuse=reuse):
+                    print 'Building Decoder: ['+k+']...' + (' (shared params)' if reuse else '')
+                    state = self.encoder.state if propagate_state else None
+                    decoder = Decoder(embedding,
+                                      decoder_max_len, state, self.encoder.attention_matrix, cell,
+                                      feed_previous=forward_only, initial_state_attention=False,
+                                      **decoder_args.get(k, {}))
+                with tf.variable_scope("decoder_"+vs_key):
+                    weight = decoder_args.get(k, {}).get('weight', tf.placeholder(tf.float32, shape=[None], name="decoder_{0}_weight".format(vs_key)))
+
+                    # instance weighted
+                    instance_loss = tf.mul(weight, decoder.instance_loss)
+
+                    # aggregate loss over batch
+                    weighted_loss = tf.reduce_sum(instance_loss)
+                    weighted_loss = weighted_loss / math_ops.cast(array_ops.shape(decoder.targets[0])[0], weighted_loss.dtype)
+
+                    if self.loss == None:
+                        self.loss = weighted_loss
+                    else:
+                        self.loss += weighted_loss
+
+                    self.decoders[k] = {
+                        'decoder': decoder,
+                        'weight': weight,
+                        'instance_loss': instance_loss,
+                        'weighted_loss': weighted_loss
+                    }
+
+    def decode_batch(self, session, feed, index_vocab):
+        batch_by_decoder = {k:d['decoder'].decode_batch(session, feed, index_vocab) for k, d in self.decoders.iteritems()}
+        batch_size = len(batch_by_decoder.values()[0])
+        return [{k:batch_by_decoder[k][i] for k in self.decoders.iterkeys()} for i in xrange(batch_size)]
+
+    def transform_batch(self, feed, data):
+        for k, d in self.decoders.iteritems():
+            instances = [instance.get(k, []) for instance in data]
+            feed[d['weight'].name] = [(1.0 if i else 0.0) for i in instances]
+            d['decoder'].transform_batch(feed, instances)
+            
+class MIMO(object):
+    def __init__(self,
+        vocab_size, size, num_layers, batch_size,
+        encoder_max_lens, decoder_max_lens,
+        share_encoder, share_decoder,
+        num_samples=512, forward_only=False,
+        encoder_args=None,
+        decoder_args=None):
+        
+        self.batch_size = batch_size
+        self.forward_only = forward_only
+        
+        with tf.variable_scope("mimo") as vs:
+            with tf.device("/cpu:0"):
+                sqrt3 = math.sqrt(3)
+                initializer = tf.random_uniform_initializer(-sqrt3, sqrt3)
+                embedding = tf.get_variable("embedding", [vocab_size, size], initializer=initializer)
+
+            self.encoder = MultiEncoder(
+                vocab_size, size, 1, batch_size, embedding,
+                encoder_max_lens, share_encoder, encoder_args=encoder_args)
+
+            self.decoder = MultiDecoder(
+                self.encoder,
+                vocab_size, size, num_layers, batch_size, embedding,
+                decoder_max_lens, share_decoder,
+                num_samples=num_samples, forward_only=forward_only,
+                decoder_args=decoder_args)
+
+    def decode_batch(self, session, feed, index_vocab):
+        return self.decoder.decode_batch(session, feed, index_vocab)
+
+    @property
+    def loss(self):
+        return self.decoder.loss
+
+    def transform_batch(self, feed, data):
+        source_seqs, target_seqs = data
+        self.encoder.transform_batch(feed, source_seqs)
+        self.decoder.transform_batch(feed, target_seqs)
