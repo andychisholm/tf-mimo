@@ -96,7 +96,23 @@ def attention_decoder(decoder_inputs, sequence_length, initial_state, attention_
         attn_size = attention_matrix.get_shape()[-1].value
         batch_attn_size = tf.stack([batch_size, attn_size])
 
-        def _attention(query, states):
+        def _attention_dot(query, states):
+            """Put attention masks on hidden using hidden_features and query."""
+            attn_length = states.get_shape()[1].value
+
+            hidden = array_ops.reshape(states, [-1, attn_length, 1, attn_size])
+            y = _linear(query, attn_size, True)
+
+            # dot product to produce the attention over incoming states
+            s = tf.reduce_sum(tf.multiply(states, tf.expand_dims(y, 1)), -1)
+            a = nn_ops.softmax(s)
+
+            # Now calculate the attention-weighted vector d.
+            d = math_ops.reduce_sum(array_ops.reshape(a, [-1, attn_length, 1, 1]) * hidden, [1, 2])
+            d = array_ops.reshape(d, [-1, attn_size])
+            return d
+
+        def _attention_concat(query, states):
             """Put attention masks on hidden using hidden_features and query."""
             v = variable_scope.get_variable("AttnV", [attn_size])
             k = variable_scope.get_variable("AttnW", [1, 1, attn_size, attn_size])
@@ -117,6 +133,8 @@ def attention_decoder(decoder_inputs, sequence_length, initial_state, attention_
             d = math_ops.reduce_sum(array_ops.reshape(a, [-1, attn_length, 1, 1]) * hidden, [1, 2])
             d = array_ops.reshape(d, [-1, attn_size])
             return d
+
+        _attention = _attention_dot
 
         def attention(query):
             outer_states = tf.unstack(attention_matrix, axis=1)
