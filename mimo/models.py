@@ -370,6 +370,29 @@ class Decoder(object):
             return emb_prev
         return loop_function
 
+    @staticmethod
+    def _extract_grumble_softmax_embed(embedding, output_projection=None, update_embedding=True):
+        def sample_gumbel(shape, eps=1e-20):
+            """Sample from Gumbel(0, 1)"""
+            U = tf.random_uniform(shape, minval=0, maxval=1)
+            return -tf.log(-tf.log(U + eps) + eps)
+
+        def gumbel_softmax_sample(logits, temperature):
+            """ Draw a sample from the Gumbel-Softmax distribution"""
+            y = logits + sample_gumbel(tf.shape(logits))
+            return tf.nn.softmax(y / temperature)
+
+        def loop_function(prev, _):
+            if output_projection is not None:
+                prev = nn_ops.xw_plus_b(prev, output_projection[0], output_projection[1])
+                prev_probs = gumbel_softmax_sample(prev, 0.75)
+
+            emb_prev = tf.reduce_sum(embedding * tf.expand_dims(prev_probs, -1), 1)
+            if not update_embedding:
+                emb_prev = array_ops.stop_gradient(emb_prev)
+            return emb_prev
+        return loop_function
+
 class MultiEncoder(object):
     def __init__(self,
         vocab_size, size, num_layers, batch_size, embedding,
