@@ -10,8 +10,6 @@ from collections import defaultdict
 import tensorflow as tf
 from tensorflow.python.ops import variable_scope as vs
 from tensorflow.python.ops import variable_scope
-from tensorflow.python.ops import rnn_cell
-from tensorflow.python.ops import rnn
 from tensorflow.python.ops.rnn import _rnn_step
 from tensorflow.python.ops import nn_ops
 from tensorflow.python.ops import math_ops
@@ -22,10 +20,23 @@ from tensorflow.python.ops import array_ops
 from tensorflow.python.framework import ops
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import tensor_shape
-from tensorflow.python.ops.seq2seq import sequence_loss_by_example
-from tensorflow.python.ops import rnn, rnn_cell
+from tensorflow.contrib.legacy_seq2seq.python.ops.seq2seq import sequence_loss_by_example
 from tensorflow.python.ops import nn_ops
-from tensorflow.python.ops.nn import _compute_sampled_logits
+from tensorflow.python.ops.nn_impl import _compute_sampled_logits
+
+#from tensorflow.contrib.learn.python.learn.models import bidirectional_rnn
+
+from tensorflow.contrib.rnn.python.ops.core_rnn import static_bidirectional_rnn
+from tensorflow.contrib.rnn.python.ops.core_rnn import static_rnn
+
+from tensorflow.python.ops.rnn_cell_impl import _RNNCell as RNNCell
+from tensorflow.contrib.rnn.python.ops.core_rnn_cell_impl import OutputProjectionWrapper, GRUCell, MultiRNNCell
+from tensorflow.contrib.rnn.python.ops import core_rnn_cell_impl
+_linear = core_rnn_cell_impl._linear
+
+from tensorflow.contrib.rnn import LayerNormBasicLSTMCell
+
+VERSION=1
 
 def sampled_sigmoid_loss(weights, biases, inputs, labels, num_sampled,
                          num_classes, num_true=2,
@@ -41,7 +52,7 @@ def sampled_sigmoid_loss(weights, biases, inputs, labels, num_sampled,
         remove_accidental_hits=remove_accidental_hits,
         partition_strategy=partition_strategy,
         name=name)
-    sampled_losses = nn_ops.sigmoid_cross_entropy_with_logits(logits, labels)
+    sampled_losses = nn_ops.sigmoid_cross_entropy_with_logits(logits=logits, labels=labels)
     return sampled_losses
 
 def attention_decoder(decoder_inputs, sequence_length, initial_state, attention_matrix, cell,
@@ -75,7 +86,7 @@ def attention_decoder(decoder_inputs, sequence_length, initial_state, attention_
 
         if sequence_length is not None:
             sequence_length = math_ops.to_int32(sequence_length)
-            zero_output = array_ops.zeros(array_ops.pack([batch_size, cell.output_size]), decoder_inputs[0].dtype)
+            zero_output = array_ops.zeros(tf.stack([batch_size, cell.output_size]), decoder_inputs[0].dtype)
             zero_output.set_shape(tensor_shape.TensorShape([fixed_batch_size.value, cell.output_size]))
             min_sequence_length = math_ops.reduce_min(sequence_length)
             max_sequence_length = math_ops.reduce_max(sequence_length)
@@ -83,7 +94,7 @@ def attention_decoder(decoder_inputs, sequence_length, initial_state, attention_
         # ATTENTION COMPUTATION
         
         attn_size = attention_matrix.get_shape()[-1].value
-        batch_attn_size = array_ops.pack([batch_size, attn_size])
+        batch_attn_size = tf.stack([batch_size, attn_size])
 
         def _attention(query, states):
             """Put attention masks on hidden using hidden_features and query."""
@@ -97,7 +108,7 @@ def attention_decoder(decoder_inputs, sequence_length, initial_state, attention_
             hidden = array_ops.reshape(states, [-1, attn_length, 1, attn_size])
             hidden_features = nn_ops.conv2d(hidden, k, [1, 1, 1, 1], "SAME")
 
-            y = rnn_cell._linear(query, attn_size, True)
+            y = _linear(query, attn_size, True)
             y = array_ops.reshape(y, [-1, 1, 1, attn_size])
             # Attention mask is a softmax of v^T * tanh(...).
             s = math_ops.reduce_sum(v * math_ops.tanh(hidden_features + y), [2, 3])
@@ -108,7 +119,7 @@ def attention_decoder(decoder_inputs, sequence_length, initial_state, attention_
             return d
 
         def attention(query):
-            outer_states = tf.unpack(attention_matrix, axis=1)
+            outer_states = tf.unstack(attention_matrix, axis=1)
 
             inner_states = []
             for i, states in enumerate(outer_states):
@@ -116,7 +127,7 @@ def attention_decoder(decoder_inputs, sequence_length, initial_state, attention_
                     inner_states.append(_attention(query, states))
 
             with variable_scope.variable_scope("Attention_inner"):
-                return _attention(query, tf.pack(inner_states, 1))
+                return _attention(query, tf.stack(inner_states, 1))
 
         state = cell.zero_state(batch_size, dtype) if initial_state == None else initial_state
         outputs = []
@@ -138,7 +149,7 @@ def attention_decoder(decoder_inputs, sequence_length, initial_state, attention_
             input_size = inp.get_shape().with_rank(2)[1]
             if input_size.value is None:
                 raise ValueError("Could not infer input size from input: %s" % inp.name)
-            x = rnn_cell._linear([inp] + [attns], input_size, True)
+            x = _linear([inp] + [attns], input_size, True)
 
             if sequence_length is not None:
                 call_cell = lambda: cell(x, state)
@@ -157,7 +168,7 @@ def attention_decoder(decoder_inputs, sequence_length, initial_state, attention_
                 attns = attention(state)
 
             with variable_scope.variable_scope("AttnOutputProjection"):
-                output = rnn_cell._linear([cell_output] + [attns], output_size, True)
+                output = _linear([cell_output] + [attns], output_size, True)
             if loop_function is not None:
                 prev = output
             outputs.append(output)
@@ -181,14 +192,17 @@ class Encoder(object):
         self.weights = kwargs.get('weights', [tf.placeholder(tf.float32, shape=[None], name="encoder_weight{0}".format(i)) for i in xrange(max_length)])
 
         inputs = [embedding_ops.embedding_lookup(embedding, i) for i in self.inputs]
-        self.outputs, self.state_fw, self.state_bw = rnn.bidirectional_rnn(self.cell, self.cell, inputs, sequence_length=self.lengths, dtype=dtype)
 
-        #self.outputs = [tf.add(*tf.split(1, 2, o)) for o in self.outputs]
-        self.state = self.state_fw + self.state_bw # aggregate fw+bw states
-        #self.state = tf.concat(1, [self.state_fw, self.state_bw]) # concatenate fw+bw states
+        #self.outputs, self.state = rnn(self.cell, inputs, sequence_length=self.lengths, dtype=dtype)
 
-        top_states = [array_ops.reshape(e, [-1, 1, cell.output_size]) for e in self.outputs]
-        self.attention_states = array_ops.concat(1, top_states)
+        # BiRNN
+        self.outputs, self.state_fw, self.state_bw = static_bidirectional_rnn(self.cell, self.cell, inputs, sequence_length=self.lengths, dtype=dtype)
+        self.state = self.state_fw + self.state_bw # aggregate fw+bw state (use this)
+        #self.outputs = [tf.add(*tf.split(1, 2, o)) for o in self.outputs] # concat fw + bw states
+        #self.state = tf.concat([self.state_fw, self.state_bw], 1) # concatenate fw+bw states
+
+        top_states = [array_ops.reshape(e, [-1, 1, cell.output_size*2]) for e in self.outputs]
+        self.attention_states = array_ops.concat(top_states, 1)
 
     def transform_batch(self, feed, data):
         data = [[GO_ID]+seq+[EOS_ID] for seq in data]
@@ -231,20 +245,29 @@ class Decoder(object):
         self.feed_previous = feed_previous
         
         if num_samples > 0 and num_samples < num_symbols:
-            with tf.device('/cpu:0'):
-                w = tf.get_variable('proj_w', [cell.output_size, num_symbols])
-                w_t = tf.transpose(w)
-                b = tf.get_variable('proj_b', [num_symbols])
+            #with tf.device('/cpu:0'):
+            w = tf.get_variable('proj_w', [cell.output_size, num_symbols])
+            w_t = tf.transpose(w)
+            b = tf.get_variable('proj_b', [num_symbols])
             output_projection = (w, b)
-            def sampled_loss(inputs, labels):
-                with tf.device('/cpu:0'):
-                    labels = tf.reshape(labels, [-1, 1])
-                    return tf.nn.sampled_softmax_loss(w_t, b, inputs, labels, num_samples, num_symbols)
+            def sampled_loss(labels, inputs):
+                #with tf.device('/cpu:0'):
+                labels = tf.reshape(labels, [-1, 1])
+                local_w_t = tf.cast(w_t, tf.float32)
+                local_b = tf.cast(b, tf.float32)
+                local_inputs = tf.cast(inputs, tf.float32)
+                return tf.nn.sampled_softmax_loss(
+                    weights=local_w_t,
+                    biases=local_b,
+                    labels=labels,
+                    inputs=local_inputs,
+                    num_sampled=num_samples,
+                    num_classes=num_symbols)
             loss_function = sampled_loss
         
         output_size = None
         if output_projection is None:
-            cell = rnn_cell.OutputProjectionWrapper(cell, num_symbols)
+            cell = OutputProjectionWrapper(cell, num_symbols)
             output_size = num_symbols
         
         if output_size is None:
@@ -256,7 +279,8 @@ class Decoder(object):
             proj_biases.get_shape().assert_is_compatible_with([num_symbols])
 
         with variable_scope.variable_scope(scope or "embedding_attention_decoder"):
-            loop_function = self._extract_argmax_and_embed(embedding, output_projection, update_embedding_for_previous) if feed_previous else None
+            loop_fn_factory = self._extract_argmax_and_embed #self._extract_grumble_softmax_embed
+            loop_function = loop_fn_factory(embedding, output_projection, update_embedding_for_previous) if feed_previous else None
 
             emb_inp = [embedding_ops.embedding_lookup(embedding, i) for i in self.inputs]
             self.outputs, self.state = attention_decoder(
@@ -280,11 +304,11 @@ class Decoder(object):
 
         if output_projection is not None:
             self.projected_output = [tf.matmul(o, output_projection[0]) + output_projection[1] for o in self.outputs]
-            self.decoded_outputs = tf.unpack(tf.argmax(tf.pack(self.projected_output), 2))
+            self.decoded_outputs = tf.unstack(tf.argmax(tf.stack(self.projected_output), 2))
         else:
-            self.decoded_outputs = tf.unpack(tf.argmax(tf.pack(self.outputs), 2))
-        self.decoded_lenghts = tf.reduce_sum(tf.sign(tf.transpose(tf.pack(self.decoded_outputs))), 1)
-        self.decoded_batch = tf.transpose(tf.pack(self.decoded_outputs))
+            self.decoded_outputs = tf.unstack(tf.argmax(tf.stack(self.outputs), 2))
+        self.decoded_lenghts = tf.reduce_sum(tf.sign(tf.transpose(tf.stack(self.decoded_outputs))), 1)
+        self.decoded_batch = tf.transpose(tf.stack(self.decoded_outputs))
 
     def decode_batch(self, session, feed, index_vocab):
         results = []
@@ -339,9 +363,10 @@ class MultiEncoder(object):
 
         self.encoder_names = [k for k, _ in encoder_max_lens.iteritems()]
 
-        cell = rnn_cell.GRUCell(size)
+        # try LayerNormBasicLSTMCell
+        cell = tf.contrib.rnn.GRUCell(size)
         if num_layers > 1:
-            cell = rnn_cell.MultiRNNCell([cell] * num_layers)
+            cell = tf.contrib.rnn.MultiRNNCell([cell] * num_layers)
         with tf.variable_scope("many_seq_to_seq"):
             self.encoders = {}
             for i, (k, encoder_max_len) in enumerate(sorted(encoder_max_lens.iteritems())):
@@ -359,11 +384,11 @@ class MultiEncoder(object):
             # TODO: may need to apply weights explicitly, i.e. (tf.reduce_sum(..)*weight)
             # sum individual encoder outputs to get aggregate attention
             states = [tf.reduce_sum(self.encoders[k]['encoder'].attention_states, 1, True) for k in self.encoder_names]
-            self.attention_states = array_ops.concat(1, states)
-            self.attention_matrix = tf.pack([self.encoders[k]['encoder'].attention_states for k in self.encoder_names], 1)
+            self.attention_states = array_ops.concat(states, 1)
+            self.attention_matrix = tf.stack([self.encoders[k]['encoder'].attention_states for k in self.encoder_names], 1)
 
             # sum individual encoder states to get aggregate state
-            self.state = tf.reduce_sum(tf.pack([self.encoders[k]['encoder'].state for k in self.encoder_names]), 0)
+            self.state = tf.reduce_sum(tf.stack([self.encoders[k]['encoder'].state for k in self.encoder_names]), 0)
 
     def transform_batch(self, feed, data):
         for k, e in self.encoders.iteritems():
@@ -386,9 +411,9 @@ class MultiDecoder(object):
         self.loss = None
         self.forward_only = forward_only
 
-        cell = rnn_cell.GRUCell(size)
+        cell = tf.contrib.rnn.GRUCell(size)
         if num_layers > 1:
-            cell = rnn_cell.MultiRNNCell([cell] * num_layers)
+            cell = tf.contrib.rnn.MultiRNNCell([cell] * num_layers)
         with tf.variable_scope("embedding_attention_seq2seq"):
             self.decoders = {}
             for i, (k, decoder_max_len) in enumerate(sorted(decoder_max_lens.iteritems())):
@@ -405,7 +430,7 @@ class MultiDecoder(object):
                     weight = decoder_args.get(k, {}).get('weight', tf.placeholder(tf.float32, shape=[None], name="decoder_{0}_weight".format(vs_key)))
 
                     # instance weighted
-                    instance_loss = tf.mul(weight, decoder.instance_loss)
+                    instance_loss = tf.multiply(weight, decoder.instance_loss)
 
                     # aggregate loss over batch
                     weighted_loss = tf.reduce_sum(instance_loss)
@@ -445,20 +470,21 @@ class MIMO(object):
         
         self.batch_size = batch_size
         self.forward_only = forward_only
+        self.embedding_size = int(size/2)
         
         with tf.variable_scope("mimo") as vs:
             with tf.device("/cpu:0"):
                 sqrt3 = math.sqrt(3)
                 initializer = tf.random_uniform_initializer(-sqrt3, sqrt3)
-                embedding = tf.get_variable("embedding", [vocab_size, size], initializer=initializer)
+                self.embedding = tf.get_variable("embedding", [vocab_size, self.embedding_size], initializer=initializer)
 
             self.encoder = MultiEncoder(
-                vocab_size, size, 1, batch_size, embedding,
+                vocab_size, self.embedding_size, 1, batch_size, self.embedding,
                 encoder_max_lens, share_encoder, encoder_args=encoder_args)
 
             self.decoder = MultiDecoder(
                 self.encoder,
-                vocab_size, size, num_layers, batch_size, embedding,
+                vocab_size, size, num_layers, batch_size, self.embedding,
                 decoder_max_lens, share_decoder,
                 num_samples=num_samples, forward_only=forward_only,
                 decoder_args=decoder_args)
