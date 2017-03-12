@@ -23,6 +23,8 @@ from tensorflow.python.framework import tensor_shape
 from tensorflow.contrib.legacy_seq2seq.python.ops.seq2seq import sequence_loss_by_example
 from tensorflow.python.ops import nn_ops
 from tensorflow.python.ops.nn_impl import _compute_sampled_logits
+from tensorflow.python.util import nest
+
 
 #from tensorflow.contrib.learn.python.learn.models import bidirectional_rnn
 
@@ -137,6 +139,14 @@ def attention_decoder(decoder_inputs, sequence_length, initial_state, attention_
         _attention = _attention_dot
 
         def attention(query):
+            if nest.is_sequence(query):
+                query_list = nest.flatten(query)
+                for q in query_list:
+                    ndims = q.get_shape().ndims
+                    if ndims:
+                        assert ndims == 2
+                query = array_ops.concat(query_list, 1)
+
             outer_states = tf.unstack(attention_matrix, axis=1)
 
             inner_states = []
@@ -404,8 +414,7 @@ class MultiEncoder(object):
 
         self.encoder_names = [k for k, _ in encoder_max_lens.iteritems()]
 
-        # try LayerNormBasicLSTMCell
-        cell = tf.contrib.rnn.GRUCell(size)
+        cell = GRUCell(size) #tf.contrib.rnn.LayerNormBasicLSTMCell(size)
         if num_layers > 1:
             cell = tf.contrib.rnn.MultiRNNCell([cell] * num_layers)
         with tf.variable_scope("many_seq_to_seq"):
@@ -452,7 +461,7 @@ class MultiDecoder(object):
         self.loss = None
         self.forward_only = forward_only
 
-        cell = tf.contrib.rnn.GRUCell(size)
+        cell = GRUCell(size) #tf.contrib.rnn.LayerNormBasicLSTMCell(size)
         if num_layers > 1:
             cell = tf.contrib.rnn.MultiRNNCell([cell] * num_layers)
         with tf.variable_scope("embedding_attention_seq2seq"):
