@@ -333,14 +333,19 @@ class Decoder(object):
         if output_projection is not None:
             self.projected_output = [tf.matmul(o, output_projection[0]) + output_projection[1] for o in self.outputs]
             self.decoded_outputs = tf.unstack(tf.argmax(tf.stack(self.projected_output), 2))
+            self.decoded_output_prob = tf.reduce_max(tf.nn.softmax(tf.stack(self.projected_output)), 2)
         else:
             self.decoded_outputs = tf.unstack(tf.argmax(tf.stack(self.outputs), 2))
+            self.decoded_output_prob = tf.reduce_max(tf.nn.softmax(tf.stack(self.outputs)), 2)
+
         self.decoded_lenghts = tf.reduce_sum(tf.sign(tf.transpose(tf.stack(self.decoded_outputs))), 1)
         self.decoded_batch = tf.transpose(tf.stack(self.decoded_outputs))
+        self.decoded_batch_probs = tf.transpose(tf.stack(self.decoded_output_prob))
 
     def decode_batch(self, session, feed, index_vocab):
         results = []
-        for outputs in session.run(self.decoded_batch, feed):
+        batch_outputs, batch_probs = session.run((self.decoded_batch, self.decoded_batch_probs), feed)
+        for outputs, probs in zip(batch_outputs, batch_probs):
             result = []
             found_eos = False
             for t in outputs:
@@ -349,7 +354,11 @@ class Decoder(object):
                 else:
                     found_eos = True
                     break
-            results.append(result if found_eos else [])
+            result = result if found_eos else []
+            results.append({
+                'sequence': result,
+                'confidences': probs[:len(result)]
+            })
         return results
     
     def transform_batch(self, feed, data):
