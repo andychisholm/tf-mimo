@@ -233,7 +233,7 @@ class Encoder(object):
         self.attention_states = array_ops.concat(top_states, 1)
 
     def transform_batch(self, feed, data):
-        data = [[GO_ID]+seq+[EOS_ID] for seq in data]
+        data = [([GO_ID]+seq+[EOS_ID]) if seq else [] for seq in data]
         feed[self.lengths.name] = [len(seq) for seq in data]
         for seq in data:
             if len(seq) > len(self.inputs):
@@ -367,7 +367,7 @@ class Decoder(object):
             feed[self.inputs[0].name] = [GO_ID]*len(data)
             feed[self.lengths.name] = [self.max_length for _ in xrange(len(data))]
         else:
-            data = [[GO_ID]+seq+[EOS_ID] for seq in data]
+            data = [([GO_ID]+seq+[EOS_ID]) if seq else [] for seq in data]
             feed[self.lengths.name] = [len(seq) for seq in data]
             for seq in data:
                 if len(seq) > len(self.inputs):
