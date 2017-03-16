@@ -477,7 +477,7 @@ class MultiDecoder(object):
             self.decoders = {}
             for i, (k, decoder_max_len) in enumerate(sorted(decoder_max_lens.iteritems())):
                 reuse = share_decoder and i != 0
-                vs_key = k.replace(' ', '_')
+                vs_key = k.replace(' ', '_').replace(',', '')
                 with tf.variable_scope("decoder"+('' if share_decoder else '_'+vs_key), reuse=reuse):
                     print 'Building Decoder: ['+k+']...' + (' (shared params)' if reuse else '')
                     state = self.encoder.state if propagate_state else None
