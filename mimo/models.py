@@ -493,8 +493,7 @@ class MultiDecoder(object):
                     instance_loss = tf.multiply(weight, decoder.instance_loss)
 
                     # aggregate loss over batch
-                    weighted_loss = tf.reduce_sum(instance_loss)
-                    weighted_loss = weighted_loss / math_ops.cast(array_ops.shape(decoder.targets[0])[0], weighted_loss.dtype)
+                    weighted_loss = tf.reduce_sum(instance_loss) / tf.reduce_sum(weight)
 
                     if self.loss == None:
                         self.loss = weighted_loss
